@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import open3d as o3d
+import os
 
 def load_depth_map(file_path):
     # PIL을 사용하여 이미지 로드
@@ -108,13 +109,105 @@ def align_point_clouds(source, target, threshold=10):
         return source.transform(reg_p2p.transformation)
     return source  # 정렬이 실패한 경우 원본 반환
 
+def create_mesh_from_pointcloud(pcd):
+    """
+    포인트 클라우드에서 메시를 생성합니다.
+    
+    Args:
+        pcd: Open3D PointCloud 객체
+    
+    Returns:
+        Open3D TriangleMesh 객체 또는 None
+    """
+    try:
+        print(f"포인트 클라우드 정보: {len(pcd.points)}개의 점")
+        
+        # 포인트 클라우드가 너무 작으면 메시 생성 불가
+        if len(pcd.points) < 100:
+            print("포인트가 너무 적어 메시 생성이 불가능합니다.")
+            return None
+        
+        # 법선 벡터가 없으면 계산
+        if not pcd.has_normals():
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=5, max_nn=30))
+        
+        # 법선 벡터 방향 통일
+        pcd.orient_normals_consistent_tangent_plane(k=15)
+        
+        # Poisson 표면 재구성을 사용하여 메시 생성
+        print("Poisson 표면 재구성을 사용하여 메시 생성 중...")
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, 
+            depth=9,  # 메시 해상도 (높을수록 더 세밀)
+            width=0,  # 0으로 설정하면 자동 계산
+            scale=1.1,
+            linear_fit=False
+        )
+        
+        # 밀도가 낮은 부분 제거 (노이즈 감소)
+        densities = np.asarray(densities)
+        vertices_to_remove = densities < np.quantile(densities, 0.1)
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+        
+        print(f"생성된 메시 정보: {len(mesh.vertices)}개의 정점, {len(mesh.triangles)}개의 삼각형")
+        
+        # 메시 후처리
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+        
+        # 메시 스무딩 (선택사항)
+        mesh = mesh.filter_smooth_simple(number_of_iterations=1)
+        
+        # 법선 벡터 재계산
+        mesh.compute_vertex_normals()
+        
+        # 원본 포인트 클라우드의 색상을 메시에 적용
+        if pcd.has_colors():
+            # 단순히 평균 색상을 사용하거나 기본 색상 설정
+            avg_color = np.mean(np.asarray(pcd.colors), axis=0)
+            mesh.paint_uniform_color(avg_color)
+        
+        return mesh
+        
+    except Exception as e:
+        print(f"메시 생성 중 오류 발생: {e}")
+        
+        # 대안으로 Ball Pivoting Algorithm 시도
+        try:
+            print("Ball Pivoting Algorithm으로 메시 생성 시도...")
+            
+            # 적절한 반지름 계산
+            distances = pcd.compute_nearest_neighbor_distance()
+            avg_dist = np.mean(distances)
+            radius = 2 * avg_dist
+            
+            # Ball Pivoting으로 메시 생성
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                pcd,
+                o3d.utility.DoubleVector([radius, radius * 2])
+            )
+            
+            if len(mesh.triangles) > 0:
+                print(f"Ball Pivoting으로 생성된 메시: {len(mesh.vertices)}개의 정점, {len(mesh.triangles)}개의 삼각형")
+                mesh.compute_vertex_normals()
+                return mesh
+            else:
+                print("Ball Pivoting으로도 메시 생성 실패")
+                return None
+                
+        except Exception as e2:
+            print(f"Ball Pivoting 메시 생성 중 오류: {e2}")
+            return None
+
 def visualize_3d_pose():
     # 각 뷰의 DepthMap 로드
     views = {
-        "front": r"d:\기타\파일 자료\파일\프로젝트 PJ\AAAAAA2_3D_자세\test\정상\정면_남\DepthMap0.bmp",
-        "right": r"d:\기타\파일 자료\파일\프로젝트 PJ\AAAAAA2_3D_자세\test\정상\오른쪽_남\DepthMap0.bmp",
-        "left": r"d:\기타\파일 자료\파일\프로젝트 PJ\AAAAAA2_3D_자세\test\정상\왼쪽_남\DepthMap0.bmp",
-        "back": r"d:\기타\파일 자료\파일\프로젝트 PJ\AAAAAA2_3D_자세\test\정상\후면_남\DepthMap0.bmp"
+        "front": r"d:\기타\파일 자료\파일\프로젝트 PJ\3D_Body_Posture_Analysis\test\정상\정면_남\DepthMap0.bmp",
+        "right": r"d:\기타\파일 자료\파일\프로젝트 PJ\3D_Body_Posture_Analysis\test\정상\오른쪽_남\DepthMap0.bmp",
+        "left": r"d:\기타\파일 자료\파일\프로젝트 PJ\3D_Body_Posture_Analysis\test\정상\왼쪽_남\DepthMap0.bmp",
+        "back": r"d:\기타\파일 자료\파일\프로젝트 PJ\3D_Body_Posture_Analysis\test\정상\후면_남\DepthMap0.bmp"
     }
     
     # 각 뷰의 포인트 클라우드 생성
@@ -187,12 +280,33 @@ def visualize_3d_pose():
     # 법선 벡터 재계산
     merged_cloud.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=5, max_nn=30))
     
+    # 메시 생성
+    print("포인트 클라우드를 메시로 변환 중...")
+    mesh = create_mesh_from_pointcloud(merged_cloud)
+    
+    # 메시 저장
+    if mesh is not None:
+        output_dir = "output/3d_models"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 메시 파일 저장
+        mesh_path = os.path.join(output_dir, "body_mesh.obj")
+        o3d.io.write_triangle_mesh(mesh_path, mesh)
+        print(f"메시가 저장되었습니다: {mesh_path}")
+        
+        # PLY 형식으로도 저장
+        mesh_ply_path = os.path.join(output_dir, "body_mesh.ply")
+        o3d.io.write_triangle_mesh(mesh_ply_path, mesh)
+        print(f"메시가 저장되었습니다: {mesh_ply_path}")
+    
     # 초기 카메라 뷰포인트 설정
     vis = o3d.visualization.Visualizer()
     vis.create_window(window_name="3D Pose Visualization", width=1024, height=768)
     
-    # 병합된 포인트 클라우드 추가
+    # 포인트 클라우드와 메시 모두 추가
     vis.add_geometry(merged_cloud)
+    if mesh is not None:
+        vis.add_geometry(mesh)
     
     # 렌더링 옵션 설정
     opt = vis.get_render_option()

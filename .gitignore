@@ -1,1 +1,5 @@
-/pose
+.output/
+output/
+output/3d_models/
+
+__pycache__/
